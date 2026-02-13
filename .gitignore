@@ -53,6 +53,12 @@ cleanup_index.py
 ky_research_findings.html
 generate_ky_analysis.py
 
+# Large data downloads (keep outputs small and reproducible)
+data/2022_recaps/
+data/openelections/
+data/openelections_repo/
+data/tl_2020_21_county20/
+
 # OS files
 Thumbs.db
 .DS_Store
