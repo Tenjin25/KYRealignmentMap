@@ -57,7 +57,9 @@ generate_ky_analysis.py
 data/2022_recaps/
 data/openelections/
 data/openelections_repo/
-data/tl_2020_21_county20/
+data/tl_2020_21_county20/*
+!data/tl_2020_21_county20/
+!data/tl_2020_21_county20/tl_2020_21_county20.geojson
 
 # OS files
 Thumbs.db
