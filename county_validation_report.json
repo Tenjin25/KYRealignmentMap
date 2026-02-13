@@ -1,0 +1,7 @@
+{
+  "total_geojson": 120,
+  "total_election": 120,
+  "matching": 120,
+  "missing_in_geojson": [],
+  "missing_in_election": []
+}
