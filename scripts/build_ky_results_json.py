@@ -10,9 +10,14 @@ import re
 
 input_dir = Path("c:/Users/Shama/OneDrive/Documents/Course_Materials/CPT-236/Side_Projects/KYRealignments/data")
 output_file = Path("c:/Users/Shama/OneDrive/Documents/Course_Materials/CPT-236/Side_Projects/KYRealignments/data/ky_election_results.json")
+county_lookup_file = input_dir / "county_name_lookup.csv"
 
 # Collect both CSV and TXT files
-csv_files = sorted(input_dir.glob("openelections/KY_*_GENERAL_COUNTY.csv"))
+csv_patterns = [
+    "openelections/KY_*_GENERAL_COUNTY.csv",
+    "*__ky__general__county.csv",
+]
+csv_files = sorted({p for pattern in csv_patterns for p in input_dir.glob(pattern)})
 
 # Find txt files more explicitly
 txt_files = []
@@ -32,8 +37,89 @@ for txt_candidate in [
 all_dataframes = []
 
 
+def normalize_county_key(text: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9 .-]", "", str(text or ""))
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def load_county_lookup(path: Path) -> tuple[dict, dict]:
+    """Load county lookup CSV and return (normalized_name_map, abbr_map)."""
+    if not path.exists():
+        raise FileNotFoundError(f"County lookup not found: {path}")
+
+    df = pd.read_csv(path, dtype=str).fillna("")
+    required_cols = {"county_name", "county_namelsad", "match_key_normalized"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"county_name_lookup.csv missing columns: {sorted(missing)}")
+
+    normalized_map = {}
+    abbr_map = {}
+
+    for _, row in df.iterrows():
+        county_name = str(row["county_name"]).strip()
+        if not county_name:
+            continue
+
+        keys = {
+            normalize_county_key(county_name),
+            normalize_county_key(row["county_namelsad"]),
+            normalize_county_key(row["match_key_normalized"]),
+        }
+        county_no_suffix = re.sub(r"\s+COUNTY$", "", normalize_county_key(county_name))
+        if county_no_suffix:
+            keys.add(county_no_suffix)
+
+        for key in keys:
+            if key:
+                normalized_map[key] = county_name
+
+        # Default 4-char abbreviation used in historical TXT county headers
+        alpha = re.sub(r"[^A-Z]", "", county_name.upper())
+        if len(alpha) >= 4:
+            abbr_map.setdefault(alpha[:4], county_name.title())
+
+    # Known SOS/TXT abbreviation quirks
+    abbr_map.update({
+        "GREU": "Greenup",
+        "KENT": "Kenton",
+        "MASO": "Mason",
+        "MCCK": "McCracken",
+        "MCCR": "McCreary",
+        "MCLE": "McLean",
+    })
+
+    # Known spelling/label variants seen in legacy files
+    normalized_map[normalize_county_key("Breckenridge")] = "Breckinridge"
+    normalized_map[normalize_county_key("Bulter")] = "Butler"
+
+    return normalized_map, abbr_map
+
+
+COUNTY_NORMALIZED_MAP, COUNTY_ABBR_MAP = load_county_lookup(county_lookup_file)
+
+
+def canonicalize_county_name(raw_county: str) -> str:
+    key = normalize_county_key(raw_county)
+    if not key:
+        return ""
+
+    if key in COUNTY_NORMALIZED_MAP:
+        return COUNTY_NORMALIZED_MAP[key]
+
+    no_suffix = re.sub(r"\s+COUNTY$", "", key)
+    if no_suffix in COUNTY_NORMALIZED_MAP:
+        return COUNTY_NORMALIZED_MAP[no_suffix]
+
+    # Stop capping all last names, just return as-is
+    return str(raw_county).strip()
+
+
 def party_bucket(party: str) -> str:
-    p = (party or "").strip().upper()
+    if not isinstance(party, str):
+        return "other"
+    p = party.strip().upper()
     if p in {"DEM", "DEMOCRAT", "D"}:
         return "dem"
     if p in {"REP", "REPUBLICAN", "R", "GOP"}:
@@ -121,12 +207,28 @@ def get_contest_name(office: str) -> str:
 def guess_party(candidate: str) -> str:
     """Heuristically guess party from candidate info (for historical txt data)."""
     name_lower = (candidate or "").lower()
-    dem_names = {"gore", "lieberman", "weinberg", "mondale", "ferraro", "dukakis", 
-                 "bentsen", "clinton", "kerry", "edwards", "obama", "biden",
-                 "harris", "waltz", "robinson", "combs", "grimes", "adkins"}
-    rep_names = {"bush", "cheney", "dole", "kemp", "reagan", "quayle", "mccain",
-                 "palin", "romney", "ryan", "trump", "pence", "mcconnell", "nolan",
-                 "williams", "forgy", "bunning"}
+    dem_names = {
+        # National
+        "gore", "lieberman", "weinberg", "mondale", "ferraro", "dukakis", 
+        "bentsen", "clinton", "kerry", "edwards", "obama", "biden",
+        "harris", "waltz", "robinson", "combs", "grimes", "adkins",
+        # 2003 KY statewide
+        "chandler", "owen", "maple", "stumbo", "luallen", "miller", "baesler",
+        # 2007 KY statewide
+        "beshear", "mongiardo", "hendrickson", "conway", "luallen", "hollenbach", "williams",
+        # 2008 US Senate
+        "lunsford",
+    }
+    rep_names = {
+        # National
+        "bush", "cheney", "dole", "kemp", "reagan", "quayle", "mccain",
+        "palin", "romney", "ryan", "trump", "pence", "mcconnell", "nolan",
+        "williams", "forgy", "bunning",
+        # 2003 KY statewide
+        "fletcher", "pence", "grayson", "wood", "greenwell", "koenig", "farmer",
+        # 2007 KY statewide
+        "fletcher", "rudolph", "grayson", "lee", "greenwell", "wheeler", "farmer",
+    }
     
     for dem in dem_names:
         if dem in name_lower:
@@ -160,31 +262,6 @@ def parse_txt_file(filepath: Path) -> pd.DataFrame:
     else:
         return pd.DataFrame()
     
-    # Simple county abbreviation mapping - Kentucky counties
-    county_map = {
-        "ADAI": "Adair", "ALLE": "Allegany", "ANDE": "Anderson", "BALL": "Ballard", "BARR": "Barren",
-        "BATH": "Bath", "BELL": "Bell", "BOON": "Boone", "BOUR": "Bourbon", "BOYD": "Boyd",
-        "BOYL": "Boyle", "BRAC": "Bracken", "BREA": "Breathitt", "BREC": "Breckenridge", "BULL": "Bullitt",
-        "BUTL": "Butler", "CALD": "Caldwell", "CALL": "Calloway", "CAMP": "Campbell", "CARL": "Carlisle",
-        "CARR": "Carroll", "CART": "Carter", "CASE": "Casey", "CHRI": "Christian", "CLAR": "Clark",
-        "CLAY": "Clay", "CLIN": "Clinton", "CRIT": "Crittenden", "CUMB": "Cumberland", "DAVI": "Daviess",
-        "DIXO": "Dixon", "FAYE": "Fayette", "FLEM": "Fleming", "FLOY": "Floyd", "FRAN": "Franklin",
-        "FULT": "Fulton", "GALL": "Gallatin", "GRAN": "Grant", "GRAV": "Graves", "GRAY": "Grayson",
-        "GREE": "Green", "HARL": "Harlan", "HARR": "Harrison", "HART": "Hart", "HEND": "Henderson",
-        "HENR": "Henry", "HOPL": "Hopkins", "HOUR": "Houston", "JACK": "Jackson", "JEFF": "Jefferson",
-        "JESS": "Jessamine", "JOHN": "Johnson", "KATE": "Kenton", "KNOW": "Knox", "LAUR": "Laurel",
-        "LAWS": "Lawrence", "LEES": "Lee", "LESL": "Leslie", "LETT": "Letcher", "LEWI": "Lewis",
-        "LIND": "Lincoln", "LIVE": "Livingston", "LOGA": "Logan", "LYON": "Lyon", "MADI": "Madison",
-        "MARI": "Marion", "MARS": "Marshall", "MART": "Martin", "MERC": "Mercer", "MIDD": "Middleton",
-        "MONT": "Montgomery", "MORG": "Morgan", "MUHL": "Muhlenberg", "NELS": "Nelson", "NICK": "Nicholas",
-        "OHIO": "Ohio", "OLDH": "Oldham", "OWEL": "Owen", "OWSL": "Owsley", "PEND": "Pendleton",
-        "PERR": "Perry", "PIKE": "Pike", "POLL": "Polk", "POWE": "Powell", "PULA": "Pulaski",
-        "ROBA": "Robertson", "ROCK": "Rockcastle", "ROWA": "Rowan", "RUSS": "Russell", "SCOT": "Scott",
-        "SHEL": "Shelby", "SIMP": "Simpson", "SPEN": "Spencer", "TAYL": "Taylor", "TODD": "Todd",
-        "TRIG": "Trigg", "TRIM": "Trimble", "UNIO": "Union", "WARR": "Warren", "WASH": "Washington",
-        "WAYN": "Wayne", "WEBS": "Webster", "WHIT": "Whitley", "WOLF": "Wolfe", "WOOD": "Woodford",
-    }
-    
     rows = []
     try:
         with open(filepath, 'r', encoding='latin-1', errors='ignore') as f:
@@ -215,9 +292,9 @@ def parse_txt_file(filepath: Path) -> pd.DataFrame:
             county_order = []
             for p in parts:
                 if p.startswith('*'):
-                    abbr = p[1:].strip()
-                    county_name = county_map.get(abbr, abbr)
-                    county_order.append(county_name)
+                    abbr = re.sub(r"[^A-Z0-9]", "", p[1:].upper())
+                    county_name = COUNTY_ABBR_MAP.get(abbr, abbr.title())
+                    county_order.append(county_name.title())
         
         # Parse vote lines (candidate + numbers)
         if current_office and county_order and line.strip() and not 'OFFICE' in line:
@@ -237,16 +314,17 @@ def parse_txt_file(filepath: Path) -> pd.DataFrame:
                         votes.append(int(clean_v))
                     
                     # Success - this is a vote line
-                    candidate = ' '.join(parts[:-len(county_order)]).strip()
+                    candidate = ' '.join(parts[:-len(county_order)]).strip().title()
                     
                     # Filter out blank lines and headers
                     if candidate and len(candidate) > 1:
                         party = guess_party(candidate)
                         for county_name, vote_count in zip(county_order, votes):
-                            if vote_count > 0:  # Only add non-zero votes
+                            canonical_county = canonicalize_county_name(county_name)
+                            if vote_count > 0 and canonical_county:  # Only add non-zero votes
                                 rows.append({
                                     'year': year,
-                                    'county': county_name,
+                                    'county': canonical_county,
                                     'office': current_office,
                                     'district': '',
                                     'candidate': candidate,
@@ -269,6 +347,9 @@ for csv_file in csv_files:
     if missing:
         print(f"Warning: {csv_file.name} missing columns: {missing}")
         continue
+    # Normalize party values using party_bucket
+    df["party"] = df["party"].apply(party_bucket)
+    # Stop uppercasing all candidate last names (leave as-is)
     all_dataframes.append(df)
 
 # Parse TXT files
@@ -277,17 +358,32 @@ for txt_file in txt_files:
     df = parse_txt_file(txt_file)
     if not df.empty:
         all_dataframes.append(df)
-        print(f"  → {len(df)} rows extracted")
+        print(f"  -> {len(df)} rows extracted")
 
 # Combine all data
 if not all_dataframes:
     raise SystemExit("No data files found!")
 
 combined_df = pd.concat(all_dataframes, ignore_index=True)
+combined_df["county"] = combined_df["county"].map(canonicalize_county_name)
+combined_df = combined_df[combined_df["county"].astype(str).str.strip() != ""].copy()
+combined_df["votes"] = (
+    pd.to_numeric(
+        combined_df["votes"].astype(str).str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+    .fillna(0)
+    .astype(int)
+)
+combined_df["year"] = pd.to_numeric(combined_df["year"], errors="coerce")
+combined_df = combined_df.dropna(subset=["year"]).copy()
+combined_df["year"] = combined_df["year"].astype(int)
 
 # List of statewide offices
 STATEWIDE_OFFICES = [
-    "president", "u.s. senate", "united states senate", "us senate",
+    "president",
+    "u.s. senate", "united states senate", "us senate",
+    "u.s. senator", "united states senator", "us senator",
     "governor", "lieutenant governor", "attorney general",
     "secretary of state", "state treasurer", "treasurer",
     "auditor of public accounts", "state auditor",
@@ -305,9 +401,14 @@ for _, row in combined_df.iterrows():
     county = str(row["county"]).strip()
     office = str(row["office"]).strip()
     district = str(row["district"]).strip() if pd.notna(row.get("district")) else ""
-    candidate = str(row["candidate"]).strip()
+    candidate = str(row["candidate"]).strip().title()
     party = str(row["party"]).strip()
     votes = int(row["votes"]) if pd.notna(row["votes"]) else 0
+
+    # Skip non-candidate rows
+    skip_candidates = {"", "Over Votes", "Under Votes", "Total Votes"}
+    if candidate in skip_candidates or party == "":
+        continue
 
     if not is_statewide_office(office):
         continue
